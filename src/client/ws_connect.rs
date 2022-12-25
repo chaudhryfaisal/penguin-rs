@@ -10,9 +10,7 @@ use rustls::{
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::net::TcpStream;
-use tokio_tungstenite::{
-    connect_async_tls_with_config, Connector, MaybeTlsStream, WebSocketStream,
-};
+use tokio_tungstenite::{client_async_with_config, Connector, MaybeTlsStream, WebSocketStream};
 use tracing::debug;
 use tungstenite::{client::IntoClientRequest, handshake::client::Request};
 use url::Url;
@@ -24,6 +22,8 @@ pub enum Error {
     CaStoreIO(#[from] std::io::Error),
     #[error("failed to parse CA store: {0}")]
     CaStoreParse(#[from] webpki::Error),
+    #[error("failed to connect to server: {0}")]
+    Connect(tokio::io::Error),
     #[error("rustls error: {0}")]
     Rustls(#[from] rustls::Error),
     #[error("tungstenite error: {0}")]
@@ -38,6 +38,19 @@ pub enum Error {
     InvalidHeaderName(#[from] http::header::InvalidHeaderName),
     #[error("invalid header: {0}")]
     InvalidHeaderFormat(String),
+}
+
+/// Types of proxies.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProxyType {
+    /// No proxy.
+    None,
+    /// HTTP proxy.
+    Http,
+    /// HTTPS proxy (i.e. TLS-encrypted HTTP proxy instead of proxy for HTTPS).
+    Https,
+    /// SOCKS5 proxy.
+    Socks,
 }
 
 pub struct TlsEmptyVerifier {}
@@ -57,7 +70,7 @@ impl ServerCertVerifier for TlsEmptyVerifier {
 }
 
 /// Load system certificates
-#[cfg(feature = "rustls-native-roots")]
+#[cfg(all(feature = "rustls-native-roots", not(feature = "rustls-webpki-roots")))]
 fn get_system_certs() -> Result<RootCertStore, Error> {
     let mut roots = RootCertStore::empty();
     for cert in rustls_native_certs::load_native_certs()? {
@@ -123,8 +136,9 @@ fn sanitize_url(url: &str) -> Result<Url, Error> {
         }
     })?;
     // Convert to a `Url`.
-    let url = match url.scheme() {
-        "wss" | "ws" => url,
+    Ok(match url.scheme() {
+        "wss" => url,
+        "ws" => url,
         "https" => {
             let mut url = url;
             url.set_scheme("wss").unwrap();
@@ -138,54 +152,18 @@ fn sanitize_url(url: &str) -> Result<Url, Error> {
         scheme => {
             return Err(Error::IncorrectScheme(scheme.to_string()));
         }
-    };
-    Ok(url)
+    })
 }
 
-#[allow(clippy::too_many_arguments)]
-#[tracing::instrument(level = "debug", skip(extra_headers))]
-pub async fn handshake(
-    server_url: &str,
-    ws_psk: Option<&str>,
-    override_hostname: Option<&str>,
-    extra_headers: Vec<String>,
+/// Create a `Connector` for `WebSocketStream`.
+fn get_connector(
+    is_tls: bool,
     tls_ca: Option<&str>,
-    tls_key: Option<&str>,
     tls_cert: Option<&str>,
+    tls_key: Option<&str>,
     tls_insecure: bool,
-) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, Error> {
-    let url = sanitize_url(server_url)?;
-    // We already sanitized https URLs to wss
-    let is_tls = url.scheme() == "wss";
-
-    // Use a request to allow additional headers
-    let mut req: Request = url.into_client_request()?;
-    let req_headers = req.headers_mut();
-    // Add protocol version
-    req_headers.insert(
-        "sec-websocket-protocol",
-        HeaderValue::from_str(PROTOCOL_VERSION)?,
-    );
-    // Add PSK
-    if let Some(ws_psk) = ws_psk {
-        req_headers.insert("x-penguin-psk", HeaderValue::from_str(ws_psk)?);
-    }
-    // Add potentially custom hostname
-    if let Some(hostname) = override_hostname {
-        req_headers.insert("host", HeaderValue::from_str(hostname)?);
-    }
-    // Now add custom headers
-    for header in &extra_headers {
-        let (name, value) = header
-            .split_once(':')
-            .ok_or(Error::InvalidHeaderFormat(header.to_string()))?;
-        req_headers.insert(
-            HeaderName::from_bytes(name.as_bytes())?,
-            HeaderValue::from_str(value.trim())?,
-        );
-    }
-
-    let connector = if is_tls {
+) -> Result<Connector, Error> {
+    if is_tls {
         let config_builder = ClientConfig::builder().with_safe_defaults();
         // Whether there is a custom CA store
         let roots = generate_rustls_rootcertstore(tls_ca)?;
@@ -205,12 +183,112 @@ pub async fn handshake(
                 .with_root_certificates(roots)
                 .with_no_client_auth(),
         };
-        Connector::Rustls(config.into())
+        Ok(Connector::Rustls(config.into()))
     } else {
         // No TLS
-        Connector::Plain
+        Ok(Connector::Plain)
+    }
+}
+
+/// Find out which type of proxy we are using.
+fn get_proxy_type(proxy: &Option<Url>) -> Result<ProxyType, Error> {
+    if proxy.is_none() {
+        return Ok(ProxyType::None);
+    }
+    match proxy.as_ref().unwrap().scheme() {
+        "http" => Ok(ProxyType::Http),
+        "https" => Ok(ProxyType::Https),
+        "socks5" | "socks5h" | "socks4" | "socks4a" => Ok(ProxyType::Socks),
+        scheme => Err(Error::IncorrectScheme(scheme.to_string())),
+    }
+}
+
+/// Perform a WebSocket handshake.
+/// Refactored from `client_main` and I know it's ugly.
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(level = "debug", skip(extra_headers))]
+pub async fn handshake(
+    server_url: &str,
+    proxy: &Option<Url>,
+    ws_psk: Option<&str>,
+    override_hostname: Option<&str>,
+    extra_headers: Vec<String>,
+    sni: Option<&str>,
+    tls_ca: Option<&str>,
+    tls_key: Option<&str>,
+    tls_cert: Option<&str>,
+    tls_insecure: bool,
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, Error> {
+    // Check the proxy scheme.
+    let proxy_type = get_proxy_type(proxy)?;
+    // Clean up the URL.
+    let url = sanitize_url(server_url)?;
+    // Find out the port to connect to.
+    // `unwrap` is safe because we already checked the scheme.
+    // and `Url` guarantees that they know the port.
+    let port = url.port_or_known_default().unwrap();
+    // We already sanitized https URLs to wss
+    let is_tls = url.scheme() == "wss";
+
+    // This host is used for `connect` and the user can override
+    // the one used for the Host header and SNI.
+    // `unwrap` is safe because we already checked the scheme.
+    // XXX: Prove me wrong.
+    let connect_host = url.domain().unwrap().to_string();
+    let mut tls_domain = connect_host.clone();
+    // Use a request to allow additional headers
+    let mut req: Request = url.into_client_request()?;
+    let req_headers = req.headers_mut();
+    // Add protocol version
+    req_headers.insert(
+        "sec-websocket-protocol",
+        HeaderValue::from_str(PROTOCOL_VERSION)?,
+    );
+    // Add PSK
+    if let Some(ws_psk) = ws_psk {
+        req_headers.insert("x-penguin-psk", HeaderValue::from_str(ws_psk)?);
+    }
+    // Potentially add custom hostname
+    if let Some(hostname) = override_hostname {
+        req_headers.insert("host", HeaderValue::from_str(hostname)?);
+        tls_domain = hostname.to_string();
+    }
+    // Potentially set custom SNI
+    if let Some(sni) = sni {
+        tls_domain = sni.to_string();
+    }
+    // Now add custom headers
+    for header in &extra_headers {
+        let (name, value) = header
+            .split_once(':')
+            .ok_or(Error::InvalidHeaderFormat(header.to_string()))?;
+        req_headers.insert(
+            HeaderName::from_bytes(name.as_bytes())?,
+            HeaderValue::from_str(value.trim())?,
+        );
+    }
+
+    let connector = get_connector(is_tls, tls_ca, tls_cert, tls_key, tls_insecure)?;
+    // Connect the TCP socket
+    match proxy_type {
+        ProxyType::None => {}
+        ProxyType::Http => {
+        }
+        ProxyType::Https => {
+        }
+        ProxyType::Socks => {
+        }
+    }
+    let addr = format!("{}:{}", connect_host, port);
+    let try_socket = TcpStream::connect(addr).await;
+    let socket = try_socket.map_err(Error::Connect)?;
+    let (ws_stream, _resp) = match connector {
+        Connector::Rustls(conn) => {
+            let connector = ClientConnection
+        }
+        Connector::Plain => client_async_with_config(req, socket, None).await,
+        _ => unreachable!("Should have been handled by `get_connector`"),
     };
-    let (ws_stream, _response) = connect_async_tls_with_config(req, None, Some(connector)).await?;
     // We don't need to check the response now...
     debug!("WebSocket handshake succeeded");
     Ok(ws_stream)

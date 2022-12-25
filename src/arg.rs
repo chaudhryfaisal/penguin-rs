@@ -119,6 +119,10 @@ pub struct ClientArgs {
     /// found in the server url).
     #[arg(long)]
     pub(crate) hostname: Option<String>,
+    /// Override the ServerName when using TLS (defaults to the
+    /// hostname).
+    #[arg(long)]
+    pub(crate) sni: Option<String>,
     /// An optional root certificate bundle used to verify the
     /// penguin server. Only valid when connecting to the server with
     /// "https" or "wss". By default, the operating system CAs will be used.

@@ -13,6 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time;
 use tracing::{info, trace, warn};
+use url::Url;
 
 /// Errors
 #[derive(Debug, Error)]
@@ -27,6 +28,8 @@ pub enum Error {
     MaxRetryCountReached,
     #[error(transparent)]
     Mux(#[from] crate::mux::Error),
+    #[error("invalid proxy URL: {0}")]
+    InvalidProxyUrl(#[from] url::ParseError),
 }
 
 // There is no extra information needed for the main loop
@@ -35,16 +38,16 @@ type Command = oneshot::Sender<DuplexStream>;
 
 #[tracing::instrument]
 pub async fn client_main(args: ClientArgs) -> Result<(), Error> {
-    // TODO: Temporary, remove when implemented
-    if args.proxy.is_some() {
-        warn!("Proxy not implemented yet");
-    }
     let mut current_retry_count: u32 = 0;
     // Initial retry interval is 200ms
     let mut current_retry_interval: u64 = 200;
     // Channel for listeners to send commands to the main loop
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command>(32);
     let mut jobs = JoinSet::new();
+    let proxy = match args.proxy {
+        Some(proxy) => Some(Url::parse(&proxy)?),
+        None => None,
+    };
     // Spawn listeners
     for remote in args.remote {
         // According to the docs, we should clone the sender before spawning the task
@@ -55,9 +58,11 @@ pub async fn client_main(args: ClientArgs) -> Result<(), Error> {
     loop {
         match ws_connect::handshake(
             &args.server,
+            &proxy,
             args.ws_psk.as_deref(),
             args.hostname.as_deref(),
             args.header.clone(),
+            args.sni.as_deref(),
             args.tls_ca.as_deref(),
             args.tls_key.as_deref(),
             args.tls_cert.as_deref(),
