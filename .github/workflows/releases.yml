@@ -37,6 +37,9 @@ jobs:
     - name: Build release
       run: cargo build --release
 
+    - name: List files
+      run: bash -c "ls -lah target/release"
+
     - name: Remove interferring files
       run: bash -c "rm -rf target/release/sibsecsh.d"
 
