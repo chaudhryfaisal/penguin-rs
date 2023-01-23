@@ -45,8 +45,11 @@ jobs:
     - name: Remove interferring files
       run: bash -c "rm -rf target/${{ matrix.config.rust_target }}/release/penguin.*"
 
+    - name: List files
+      run: bash -c "ls -lah target/${{ matrix.config.rust_target }}/release/"
+
     - name: Upload binary
       uses: actions/upload-artifact@v2.2.4
       with:
         name: penguin-${{ matrix.config.rust_target }}
-        path: target/${{ matrix.config.rust_target }}/release/penguin*
+        path: target/${{ matrix.config.rust_target }}/release/rusty-penguin
